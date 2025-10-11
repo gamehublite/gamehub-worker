@@ -5,8 +5,20 @@
  * Proxies CDN downloads to hide user IP from Chinese servers
  */
 
+import { md5 } from './md5.js';
+
 const GITHUB_BASE = 'https://raw.githubusercontent.com/gamehublite/gamehub_api/main';
 const WORKER_URL = 'https://gamehub-api.secureflex.workers.dev';
+const NEWS_AGGREGATOR_URL = 'https://gamehub-news-aggregator.secureflex.workers.dev';
+const GAMEHUB_SECRET_KEY = 'all-egg-shell-y7ZatUDk';
+
+// Generate signature for GameHub API requests
+function generateSignature(params: Record<string, any>): string {
+	const sortedKeys = Object.keys(params).filter(k => k !== 'sign').sort();
+	const paramString = sortedKeys.map(key => `${key}=${params[key]}`).join('&');
+	const signString = `${paramString}&${GAMEHUB_SECRET_KEY}`;
+	return md5(signString).toLowerCase();
+}
 
 // Map component types to their manifest files
 const TYPE_TO_MANIFEST: Record<number, string> = {
@@ -39,6 +51,124 @@ export default {
 
 		try {
 			// ============================================================
+			// TOKEN INTERCEPTION - Replace "fake-token" with real token
+			// ============================================================
+			let modifiedRequest = request;
+			let shouldReplaceToken = false;
+			let bodyText = '';
+
+			// Check if request contains "fake-token" in headers or body
+			const authHeader = request.headers.get('Authorization');
+			const tokenHeader = request.headers.get('token');
+
+			// Check headers first
+			if (authHeader?.includes('fake-token') || tokenHeader === 'fake-token') {
+				shouldReplaceToken = true;
+			}
+
+			// Check POST body for fake-token
+			if (request.method === 'POST' && request.headers.get('Content-Type')?.includes('application/json')) {
+				bodyText = await request.clone().text();
+				if (bodyText.includes('fake-token')) {
+					shouldReplaceToken = true;
+				}
+			}
+
+			// Only fetch real token if fake-token was found
+			if (shouldReplaceToken) {
+				// Try to get cached token first
+				const cacheKey = new Request(`${env.TOKEN_REFRESHER_URL}/token-cached`);
+				const cache = caches.default;
+				let cachedResponse = await cache.match(cacheKey);
+
+				let realToken: string;
+
+				if (cachedResponse) {
+					// Use cached token
+					const cachedData = await cachedResponse.json();
+					realToken = cachedData.token;
+					console.log('[TOKEN] Using cached token:', realToken);
+				} else {
+					// Cache miss - fetch fresh token
+					console.log('[TOKEN] Cache miss, fetching fresh token from refresher...');
+
+					const tokenResponse = await fetch(`${env.TOKEN_REFRESHER_URL}/token`, {
+						headers: {
+							'X-Worker-Auth': 'gamehub-internal-token-fetch-2025'
+						}
+					});
+
+					if (tokenResponse.ok) {
+						const tokenData = await tokenResponse.json();
+						realToken = tokenData.token;
+
+						// Cache the token for 4 hours (14400 seconds)
+						const cacheResponse = new Response(JSON.stringify(tokenData), {
+							headers: {
+								'Content-Type': 'application/json',
+								'Cache-Control': 'public, max-age=14400'
+							}
+						});
+
+						ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+						console.log('[TOKEN] Fetched and cached new token:', realToken);
+					} else {
+						console.error('[TOKEN] Failed to fetch real token from refresher');
+					}
+				}
+
+				if (realToken) {
+					console.log('[TOKEN] Replacing fake-token with real token');
+
+					// Clone request to modify headers/body
+					const newHeaders = new Headers(request.headers);
+
+					// Replace token in headers if present
+					if (authHeader?.includes('fake-token')) {
+						newHeaders.set('Authorization', authHeader.replace('fake-token', realToken));
+					}
+					if (tokenHeader === 'fake-token') {
+						newHeaders.set('token', realToken);
+					}
+
+					// Replace token in POST body if present
+					if (bodyText && bodyText.includes('fake-token')) {
+						// Parse the body as JSON to regenerate signature
+						const bodyJson = JSON.parse(bodyText);
+						bodyJson.token = realToken;
+
+						// Regenerate signature with new token
+						const newSignature = generateSignature(bodyJson);
+						bodyJson.sign = newSignature;
+
+						const modifiedBody = JSON.stringify(bodyJson);
+						console.log('[TOKEN] Replaced fake-token and regenerated signature');
+
+						modifiedRequest = new Request(request.url, {
+							method: request.method,
+							headers: newHeaders,
+							body: modifiedBody,
+						});
+					} else if (bodyText) {
+						modifiedRequest = new Request(request.url, {
+							method: request.method,
+							headers: newHeaders,
+							body: bodyText,
+						});
+					} else {
+						modifiedRequest = new Request(request.url, {
+							method: request.method,
+							headers: newHeaders,
+						});
+					}
+				} else {
+					console.error('[TOKEN] Failed to fetch real token from refresher');
+				}
+			}
+
+			// Use modifiedRequest for all subsequent operations
+			request = modifiedRequest;
+			// ============================================================
 			// API ENDPOINTS
 			// ============================================================
 
@@ -55,20 +185,82 @@ export default {
 
 				const responseData = await chineseResponse.json();
 
-				// Return the Chinese server response as-is (direct CDN links)
+				// Remove recommended games section to clean up UI
+				if (responseData.data) {
+					delete responseData.data.recommend_game;
+					delete responseData.data.card_line_data;
+				}
+
+				// Return the Chinese server response with recommended section removed
 				return new Response(JSON.stringify(responseData), {
 					headers: { 'Content-Type': 'application/json', ...corsHeaders },
 				});
 			}
 
-			// Handle /card/getNewsList endpoint - Return empty list (not needed)
+			// Handle /card/getNewsList endpoint - Forward to news aggregator
 			if (url.pathname === '/card/getNewsList' && request.method === 'POST') {
-				return new Response(JSON.stringify({
-					code: 200,
-					msg: "",
-					time: Math.floor(Date.now() / 1000).toString(),
-					data: []
-				}), {
+				const body = await request.json() as { page?: number; page_size?: number };
+				const page = body.page || 1;
+				const pageSize = body.page_size || 4; // Default to 4 items for lazy loading
+
+				// Forward to news aggregator worker
+				const newsResponse = await fetch(
+					`${NEWS_AGGREGATOR_URL}/api/news/list?page=${page}&page_size=${pageSize}`
+				);
+
+				if (!newsResponse.ok) {
+					return new Response(JSON.stringify({
+						code: 500,
+						msg: "Failed to fetch news",
+						time: "",
+						data: []
+					}), {
+						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					});
+				}
+
+				const newsData = await newsResponse.json();
+				return new Response(JSON.stringify(newsData), {
+					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+				});
+			}
+
+			// Handle /card/getNewsGuideDetail endpoint - Forward to news aggregator
+			if (url.pathname === '/card/getNewsGuideDetail' && request.method === 'POST') {
+				const body = await request.json() as { id?: number; source?: string };
+				const newsId = body.id;
+
+				if (!newsId) {
+					return new Response(JSON.stringify({
+						code: 400,
+						msg: "Missing id parameter",
+						time: "",
+						data: null
+					}), {
+						status: 400,
+						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					});
+				}
+
+				// Forward to news aggregator worker
+				const newsDetailResponse = await fetch(
+					`${NEWS_AGGREGATOR_URL}/api/news/detail/${newsId}`
+				);
+
+				if (!newsDetailResponse.ok) {
+					return new Response(JSON.stringify({
+						code: 404,
+						msg: "News not found",
+						time: "",
+						data: null
+					}), {
+						status: 404,
+						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					});
+				}
+
+				const newsDetailData = await newsDetailResponse.json();
+				return new Response(JSON.stringify(newsDetailData), {
 					headers: { 'Content-Type': 'application/json', ...corsHeaders },
 				});
 			}
