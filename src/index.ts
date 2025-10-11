@@ -76,45 +76,21 @@ export default {
 
 			// Only fetch real token if fake-token was found
 			if (shouldReplaceToken) {
-				// Try to get cached token first
-				const cacheKey = new Request(`${env.TOKEN_REFRESHER_URL}/token-cached`);
-				const cache = caches.default;
-				let cachedResponse = await cache.match(cacheKey);
+				// Fetch fresh token every time (NO CACHING)
+				const tokenResponse = await fetch(`${env.TOKEN_REFRESHER_URL}/token`, {
+					headers: {
+						'X-Worker-Auth': 'gamehub-internal-token-fetch-2025'
+					}
+				});
 
 				let realToken: string;
 
-				if (cachedResponse) {
-					// Use cached token
-					const cachedData = await cachedResponse.json();
-					realToken = cachedData.token;
-					console.log('[TOKEN] Using cached token:', realToken);
+				if (tokenResponse.ok) {
+					const tokenData = await tokenResponse.json();
+					realToken = tokenData.token;
+					console.log('[TOKEN] Fetched token:', realToken);
 				} else {
-					// Cache miss - fetch fresh token
-					console.log('[TOKEN] Cache miss, fetching fresh token from refresher...');
-
-					const tokenResponse = await fetch(`${env.TOKEN_REFRESHER_URL}/token`, {
-						headers: {
-							'X-Worker-Auth': 'gamehub-internal-token-fetch-2025'
-						}
-					});
-
-					if (tokenResponse.ok) {
-						const tokenData = await tokenResponse.json();
-						realToken = tokenData.token;
-
-						// Cache the token for 4 hours (14400 seconds)
-						const cacheResponse = new Response(JSON.stringify(tokenData), {
-							headers: {
-								'Content-Type': 'application/json',
-								'Cache-Control': 'public, max-age=14400'
-							}
-						});
-
-						ctx.waitUntil(cache.put(cacheKey, cacheResponse));
-						console.log('[TOKEN] Fetched and cached new token:', realToken);
-					} else {
-						console.error('[TOKEN] Failed to fetch real token from refresher');
-					}
+					console.error('[TOKEN] Failed to fetch real token from refresher');
 				}
 
 				if (realToken) {
@@ -141,13 +117,13 @@ export default {
 						const newSignature = generateSignature(bodyJson);
 						bodyJson.sign = newSignature;
 
-						const modifiedBody = JSON.stringify(bodyJson);
+						bodyText = JSON.stringify(bodyJson);
 						console.log('[TOKEN] Replaced fake-token and regenerated signature');
 
 						modifiedRequest = new Request(request.url, {
 							method: request.method,
 							headers: newHeaders,
-							body: modifiedBody,
+							body: bodyText,
 						});
 					} else if (bodyText) {
 						modifiedRequest = new Request(request.url, {
@@ -162,7 +138,7 @@ export default {
 						});
 					}
 				} else {
-					console.error('[TOKEN] Failed to fetch real token from refresher');
+					console.error('[TOKEN] Failed to get valid token');
 				}
 			}
 
@@ -174,7 +150,10 @@ export default {
 
 			// Proxy /card/getGameDetail to Chinese server
 			if (url.pathname === '/card/getGameDetail' && request.method === 'POST') {
-				const bodyText = await request.text();
+				// Reuse bodyText if we already read it during token replacement
+				if (!bodyText) {
+					bodyText = await request.text();
+				}
 
 				// Forward request to Chinese server with all original headers (for signature)
 				const chineseResponse = await fetch('https://landscape-api.vgabc.com/card/getGameDetail', {
