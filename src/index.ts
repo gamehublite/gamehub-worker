@@ -308,39 +308,23 @@ export default {
 				});
 			}
 
-			// Proxy /simulator/executeScript to Chinese server (with privacy protection)
+			// Proxy /simulator/executeScript to Chinese server (NO sanitization)
 			if (url.pathname === '/simulator/executeScript' && request.method === 'POST') {
-				const body = await request.json();
+				// Reuse bodyText if we already read it during token replacement
+				if (!bodyText) {
+					bodyText = await request.text();
+				}
 
-				// Sanitize request - ONLY send gpu_vendor, strip device fingerprint
-				// The API only uses gpu_vendor to decide which components to return
-				const sanitizedBody = {
-					gpu_vendor: body.gpu_vendor,  // ← ONLY real field needed for config!
-					gpu_version: 0,  // Generic
-					gpu_device_name: "Generic Device",
-					game_type: body.game_type || 2,
-					token: body.token,  // Required for API auth
-					game_id: "0",  // Generic game ID
-					sign: body.sign,  // Required for request validation
-					time: body.time,
-					clientparams: "5.1.0|0|en|Generic|1920*1080|app|app|generic|||||||||com.app|Generic|generic",
-					gpu_system_driver_version: 0
-				};
-
-				console.log(`[PRIVACY] executeScript - GPU vendor: ${body.gpu_vendor}, stripped device fingerprint`);
-
-				// Forward sanitized request to Chinese server
+				// Forward request AS-IS to Chinese server with all original headers
 				const chineseResponse = await fetch('https://landscape-api.vgabc.com/simulator/executeScript', {
 					method: 'POST',
-					headers: {
-						'Content-Type': 'application/json',
-					},
-					body: JSON.stringify(sanitizedBody),
+					headers: request.headers,
+					body: bodyText,
 				});
 
 				const responseData = await chineseResponse.json();
 
-				// Return the Chinese server response as-is (direct CDN links)
+				// Return the Chinese server response as-is
 				return new Response(JSON.stringify(responseData), {
 					headers: { 'Content-Type': 'application/json', ...corsHeaders },
 				});
