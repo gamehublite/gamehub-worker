@@ -32,7 +32,17 @@
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
-	"vars": { "TOKEN_REFRESHER_URL": "https://gamehub-token-refresher.secureflex.workers.dev" }
+	"vars": { "TOKEN_REFRESHER_URL": "https://gamehub-token-refresher.secureflex.workers.dev" },
+	/**
+	 * KV Namespace (shared with token-refresher)
+	 * Allows direct access to tokens without HTTP calls
+	 */
+	"kv_namespaces": [
+		{
+			"binding": "TOKEN_STORE",
+			"id": "534c5e623d444d0e9ae656a0f04227cb"
+		}
+	]
 	/**
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/

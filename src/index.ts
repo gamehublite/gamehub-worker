@@ -76,21 +76,32 @@ export default {
 
 			// Only fetch real token if fake-token was found
 			if (shouldReplaceToken) {
-				// Fetch fresh token every time (NO CACHING)
-				const tokenResponse = await fetch(`${env.TOKEN_REFRESHER_URL}/token`, {
-					headers: {
-						'X-Worker-Auth': 'gamehub-internal-token-fetch-2025'
-					}
-				});
+				// Read token directly from KV (shared with token-refresher)
+				// This avoids HTTP calls and reduces token-refresher load from 600k+ to ~0
+				const tokenDataStr = await env.TOKEN_STORE.get('gamehub_token');
 
 				let realToken: string;
 
-				if (tokenResponse.ok) {
-					const tokenData = await tokenResponse.json();
+				if (tokenDataStr) {
+					const tokenData = JSON.parse(tokenDataStr);
 					realToken = tokenData.token;
-					console.log('[TOKEN] Fetched token:', realToken);
+					console.log('[TOKEN] Using token from KV:', realToken);
 				} else {
-					console.error('[TOKEN] Failed to fetch real token from refresher');
+					// Fallback: HTTP fetch if KV is empty (shouldn't happen after first cron run)
+					console.warn('[TOKEN] KV empty, falling back to HTTP fetch');
+					const tokenResponse = await fetch(`${env.TOKEN_REFRESHER_URL}/token`, {
+						headers: {
+							'X-Worker-Auth': 'gamehub-internal-token-fetch-2025'
+						}
+					});
+
+					if (tokenResponse.ok) {
+						const tokenData = await tokenResponse.json();
+						realToken = tokenData.token;
+						console.log('[TOKEN] Fetched token via HTTP fallback:', realToken);
+					} else {
+						console.error('[TOKEN] Failed to fetch token (KV empty + HTTP failed)');
+					}
 				}
 
 				if (realToken) {
@@ -171,6 +182,59 @@ export default {
 				}
 
 				// Return the Chinese server response with recommended section removed
+				return new Response(JSON.stringify(responseData), {
+					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+				});
+			}
+
+			// Handle /search/getGameList endpoint - Filter to show only Steam games
+			if (url.pathname === '/search/getGameList' && request.method === 'POST') {
+				// Reuse bodyText if we already read it during token replacement
+				if (!bodyText) {
+					bodyText = await request.text();
+				}
+
+				// Forward request to Chinese server with all original headers (for signature)
+				const chineseResponse = await fetch('https://landscape-api.vgabc.com/search/getGameList', {
+					method: 'POST',
+					headers: request.headers,
+					body: bodyText,
+				});
+
+				const responseData = await chineseResponse.json();
+
+				// Filter to show only Steam games (steam_appid !== "0" and steam_appid exists)
+				if (responseData.data && responseData.data.list) {
+					const originalCount = responseData.data.list.length;
+
+					// Keep only games with valid Steam app IDs
+					responseData.data.list = responseData.data.list.filter(game => {
+						return game.steam_appid && game.steam_appid !== "0" && game.steam_appid !== "";
+					});
+
+					const filteredCount = responseData.data.list.length;
+					console.log(`[SEARCH] Filtered games: ${originalCount} -> ${filteredCount} (Steam only)`);
+
+					// Update total counts to show only "All" tab with correct count
+					if (responseData.data.total) {
+						responseData.data.total = [
+							{
+								classify_group_id: 0,  // 0 = "All" tab
+								count: filteredCount
+							}
+						];
+					}
+
+					// Update all_game_ids to match filtered list
+					if (responseData.data.all_game_ids) {
+						responseData.data.all_game_ids = responseData.data.list.map(game => ({
+							steam_app_id: game.steam_appid,
+							game_id: game.id
+						}));
+					}
+				}
+
+				// Return the filtered response
 				return new Response(JSON.stringify(responseData), {
 					headers: { 'Content-Type': 'application/json', ...corsHeaders },
 				});
