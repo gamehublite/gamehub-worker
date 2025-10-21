@@ -44,9 +44,19 @@ export default {
 			'Access-Control-Allow-Headers': 'Content-Type',
 		};
 
+		// GLOBAL CACHE DISABLE - No caching anywhere
+		const noCacheHeaders = {
+			'Cache-Control': 'no-cache, no-store, must-revalidate, max-age=0, s-maxage=0',
+			'Pragma': 'no-cache',
+			'Expires': '0',
+		};
+
+		// Combine CORS + No-Cache headers for all responses
+		const allHeaders = { ...corsHeaders, ...noCacheHeaders };
+
 		// Handle CORS preflight
 		if (request.method === 'OPTIONS') {
-			return new Response(null, { headers: corsHeaders });
+			return new Response(null, { headers: allHeaders });
 		}
 
 		try {
@@ -183,7 +193,10 @@ export default {
 
 				// Return the Chinese server response with recommended section removed
 				return new Response(JSON.stringify(responseData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: {
+						'Content-Type': 'application/json',
+						...allHeaders
+					},
 				});
 			}
 
@@ -236,7 +249,7 @@ export default {
 
 				// Return the filtered response
 				return new Response(JSON.stringify(responseData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
@@ -258,13 +271,13 @@ export default {
 						time: "",
 						data: []
 					}), {
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
 				const newsData = await newsResponse.json();
 				return new Response(JSON.stringify(newsData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
@@ -281,7 +294,7 @@ export default {
 						data: null
 					}), {
 						status: 400,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
@@ -298,14 +311,157 @@ export default {
 						data: null
 					}), {
 						status: 404,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
 				const newsDetailData = await newsDetailResponse.json();
 				return new Response(JSON.stringify(newsDetailData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
+			}
+
+			// Handle /card/getIndexList endpoint - Serve free games from KV storage
+			if (url.pathname === '/card/getIndexList' && request.method === 'POST') {
+				console.log('[FREE_GAMES] Reading free games from KV storage');
+
+				try {
+					// Read directly from KV (same storage as Free Games Worker)
+					const cachedData = await env.FREE_GAMES_KV.get('free_games_data');
+
+					if (!cachedData) {
+						console.log('[FREE_GAMES] No data in KV storage');
+						return new Response(JSON.stringify({
+							code: 201,
+							msg: 'No free games available at the moment, please try again later',
+							data: [],
+							time: Math.floor(Date.now() / 1000).toString()
+						}), {
+							headers: { 'Content-Type': 'application/json', ...allHeaders },
+						});
+					}
+
+					console.log('[FREE_GAMES] Successfully read free games from KV');
+
+					// Parse the data and limit card_list to display_card_num
+					const freeGamesData = JSON.parse(cachedData);
+
+					// Slice each topic's card_list to display_card_num (initially show 6 items max)
+					freeGamesData.data = freeGamesData.data.map(topic => ({
+						...topic,
+						card_list: topic.card_list.slice(0, topic.display_card_num)
+					}));
+
+					return new Response(JSON.stringify(freeGamesData), {
+						headers: {
+							'Content-Type': 'application/json',
+							...allHeaders // NO CACHE
+						},
+					});
+				} catch (error) {
+					console.error('[FREE_GAMES] Error reading from KV:', error);
+					return new Response(JSON.stringify({
+						code: 500,
+						msg: 'Internal server error',
+						data: [],
+						time: Math.floor(Date.now() / 1000).toString()
+					}), {
+						status: 500,
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
+					});
+				}
+			}
+
+			// Handle /card/more endpoint - Get all items for a specific topic
+			if (url.pathname === '/card/more' && request.method === 'POST') {
+				console.log('[FREE_GAMES_MORE] Getting more items for topic');
+
+				try {
+					const body = await request.json();
+					const topicId = body.id;
+					const page = body.page || 1;
+					const pageSize = body.page_size || 30;
+
+					if (!topicId) {
+						return new Response(JSON.stringify({
+							code: 400,
+							msg: 'Missing topic ID',
+							time: Math.floor(Date.now() / 1000).toString(),
+							data: null
+						}), {
+							status: 400,
+							headers: { 'Content-Type': 'application/json', ...allHeaders },
+						});
+					}
+
+					// Read free games data from KV
+					const cachedData = await env.FREE_GAMES_KV.get('free_games_data');
+
+					if (!cachedData) {
+						return new Response(JSON.stringify({
+							code: 201,
+							msg: 'No data available',
+							time: Math.floor(Date.now() / 1000).toString(),
+							data: null
+						}), {
+							headers: { 'Content-Type': 'application/json', ...allHeaders },
+						});
+					}
+
+					const freeGamesData = JSON.parse(cachedData);
+					const topic = freeGamesData.data.find(t => t.id === topicId);
+
+					if (!topic) {
+						return new Response(JSON.stringify({
+							code: 404,
+							msg: 'Topic not found',
+							time: Math.floor(Date.now() / 1000).toString(),
+							data: null
+						}), {
+							status: 404,
+							headers: { 'Content-Type': 'application/json', ...allHeaders },
+						});
+					}
+
+					// Return all cards for this topic (pagination handled by app)
+					const startIndex = (page - 1) * pageSize;
+					const endIndex = startIndex + pageSize;
+					const paginatedCards = topic.card_list.slice(startIndex, endIndex);
+
+					return new Response(JSON.stringify({
+						code: 0,
+						msg: '',
+						time: Math.floor(Date.now() / 1000).toString(),
+						data: {
+							id: topic.id,
+							title: topic.title,
+							aspect_ratio: topic.aspect_ratio,
+							fixed_card_size: topic.fixed_card_size,
+							is_play_video: topic.is_play_video,
+							page: page,
+							page_size: pageSize,
+							is_vertical: topic.is_vertical,
+							is_text_outside: topic.is_text_outside,
+							card_list: paginatedCards
+						}
+					}), {
+						headers: {
+							'Content-Type': 'application/json',
+							...allHeaders // NO CACHE
+						},
+					});
+				} catch (error) {
+					console.error('[FREE_GAMES_MORE] Error:', error);
+					return new Response(JSON.stringify({
+						code: 500,
+						msg: 'Internal server error',
+						time: Math.floor(Date.now() / 1000).toString(),
+						data: null
+					}), {
+						status: 500,
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
+					});
+				}
 			}
 
 			// Proxy /simulator/executeScript to Chinese server (NO sanitization)
@@ -324,9 +480,12 @@ export default {
 
 				const responseData = await chineseResponse.json();
 
-				// Return the Chinese server response as-is
+				// Return the Chinese server response as-is (no cache)
 				return new Response(JSON.stringify(responseData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: {
+						'Content-Type': 'application/json',
+						...allHeaders
+					},
 				});
 			}
 
@@ -338,13 +497,13 @@ export default {
 				if (!response.ok) {
 					return new Response(JSON.stringify({ code: 500, msg: 'Failed to fetch base info' }), {
 						status: 500,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
 				const data = await response.json();
 				return new Response(JSON.stringify(data), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
@@ -356,13 +515,13 @@ export default {
 				if (!response.ok) {
 					return new Response(JSON.stringify({ code: 500, msg: 'Failed to check timer' }), {
 						status: 500,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
 				const data = await response.json();
 				return new Response(JSON.stringify(data), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
@@ -374,14 +533,14 @@ export default {
 				if (!dnsPoolResponse.ok) {
 					return new Response(JSON.stringify({ code: 500, msg: 'Failed to fetch DNS pool' }), {
 						status: 500,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
 				const dnsPoolData = await dnsPoolResponse.json();
 
 				return new Response(JSON.stringify(dnsPoolData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
@@ -393,14 +552,14 @@ export default {
 				if (!hostsResponse.ok) {
 					return new Response(JSON.stringify({ code: 500, msg: 'Failed to fetch Steam hosts' }), {
 						status: 500,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
 				const hostsText = await hostsResponse.text();
 
 				return new Response(hostsText, {
-					headers: { 'Content-Type': 'text/plain', ...corsHeaders },
+					headers: { 'Content-Type': 'text/plain', ...allHeaders },
 				});
 			}
 
@@ -412,7 +571,7 @@ export default {
 					time: Math.floor(Date.now() / 1000).toString(),
 					data: []
 				}), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
@@ -427,7 +586,7 @@ export default {
 				if (!type || !TYPE_TO_MANIFEST[type]) {
 					return new Response(JSON.stringify({ code: 400, msg: 'Invalid type parameter' }), {
 						status: 400,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
@@ -438,7 +597,7 @@ export default {
 				if (!response.ok) {
 					return new Response(JSON.stringify({ code: 500, msg: 'Failed to fetch manifest' }), {
 						status: 500,
-						headers: { 'Content-Type': 'application/json', ...corsHeaders },
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
 					});
 				}
 
@@ -470,16 +629,16 @@ export default {
 
 				// Return the manifest data with direct CDN links
 				return new Response(JSON.stringify(manifestData), {
-					headers: { 'Content-Type': 'application/json', ...corsHeaders },
+					headers: { 'Content-Type': 'application/json', ...allHeaders },
 				});
 			}
 
-			// Proxy all other requests directly to GitHub
+			// Proxy all other requests directly to GitHub (NO CACHE)
 			const githubUrl = `${GITHUB_BASE}${url.pathname}`;
 			const githubResponse = await fetch(githubUrl, {
 				cf: {
-					cacheTtl: 300, // Cache for 5 minutes
-					cacheEverything: true,
+					cacheTtl: 0, // NO CACHE
+					cacheEverything: false,
 				}
 			});
 
@@ -491,14 +650,13 @@ export default {
 				status: githubResponse.status,
 				headers: {
 					...Object.fromEntries(githubResponse.headers),
-					...corsHeaders,
-					'Cache-Control': 'public, max-age=300', // 5 minutes
+					...allHeaders, // NO CACHE - overrides any GitHub cache headers
 				},
 			});
 		} catch (error) {
 			return new Response(JSON.stringify({ code: 500, msg: `Error: ${error.message}` }), {
 				status: 500,
-				headers: { 'Content-Type': 'application/json', ...corsHeaders },
+				headers: { 'Content-Type': 'application/json', ...allHeaders },
 			});
 		}
 	},
