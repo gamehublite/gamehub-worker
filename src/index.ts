@@ -169,21 +169,94 @@ export default {
 			// API ENDPOINTS
 			// ============================================================
 
-			// Proxy /card/getGameDetail to Chinese server
-			if (url.pathname === '/card/getGameDetail' && request.method === 'POST') {
-				// Reuse bodyText if we already read it during token replacement
-				if (!bodyText) {
-					bodyText = await request.text();
+			// Proxy /card/getGameDetail to Chinese server (supports both GET and POST for backward compatibility)
+			if (url.pathname === '/card/getGameDetail') {
+				let requestBody: string;
+
+				// NEW APP: GET request with query params (?app_id=8870)
+				if (request.method === 'GET') {
+					const appId = url.searchParams.get('app_id');
+
+					if (!appId) {
+						return new Response(JSON.stringify({
+							code: 400,
+							msg: 'Missing app_id parameter',
+							time: '',
+							data: null
+						}), {
+							status: 400,
+							headers: { 'Content-Type': 'application/json', ...allHeaders },
+						});
+					}
+
+					// Build POST body with ONLY the data params (NOT auth headers)
+					// The auth headers (sign, time, token) stay in headers for signature validation
+					const bodyParams: Record<string, any> = {
+						app_id: appId,
+					};
+
+					// Add any other query params to body (if they exist)
+					for (const [key, value] of url.searchParams.entries()) {
+						if (key !== 'app_id') {
+							bodyParams[key] = value;
+						}
+					}
+
+					requestBody = JSON.stringify(bodyParams);
+					console.log('[GET→POST] Converted GET to POST. Body:', requestBody);
+				}
+				// OLD V3: POST request with body (existing behavior)
+				else if (request.method === 'POST') {
+					// Reuse bodyText if we already read it during token replacement
+					if (!bodyText) {
+						bodyText = await request.text();
+					}
+					requestBody = bodyText;
+					console.log('[POST] Using existing POST body');
+				}
+				else {
+					return new Response(JSON.stringify({
+						code: 405,
+						msg: 'Method not allowed',
+						time: '',
+						data: null
+					}), {
+						status: 405,
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
+					});
 				}
 
-				// Forward request to Chinese server with all original headers (for signature)
+				// Build headers for Chinese server request
+				const forwardHeaders = new Headers(request.headers);
+				forwardHeaders.set('Content-Type', 'application/json');
+
+				// Forward request to Chinese server with all headers (for signature)
 				const chineseResponse = await fetch('https://landscape-api.vgabc.com/card/getGameDetail', {
 					method: 'POST',
-					headers: request.headers,
-					body: bodyText,
+					headers: forwardHeaders,
+					body: requestBody,
 				});
 
-				const responseData = await chineseResponse.json();
+				// Better error handling
+				const responseText = await chineseResponse.text();
+				console.log('[CHINESE_SERVER] Response status:', chineseResponse.status);
+				console.log('[CHINESE_SERVER] Response body:', responseText);
+
+				let responseData;
+				try {
+					responseData = JSON.parse(responseText);
+				} catch (error) {
+					console.error('[CHINESE_SERVER] Failed to parse JSON response:', error);
+					return new Response(JSON.stringify({
+						code: 500,
+						msg: `Chinese server returned invalid response: ${responseText.substring(0, 100)}`,
+						time: '',
+						data: null
+					}), {
+						status: 500,
+						headers: { 'Content-Type': 'application/json', ...allHeaders },
+					});
+				}
 
 				// Remove recommended games section to clean up UI
 				if (responseData.data) {
@@ -322,10 +395,21 @@ export default {
 			}
 
 			// Handle /card/getIndexList endpoint - Serve free games from KV storage
-			if (url.pathname === '/card/getIndexList' && request.method === 'POST') {
-				console.log('[FREE_GAMES] Reading free games from KV storage');
+			// Supports both POST (old v3 app) and GET (new v5.2.0 app) for backward compatibility
+			if (url.pathname === '/card/getIndexList' && (request.method === 'POST' || request.method === 'GET')) {
+				console.log(`[FREE_GAMES] ${request.method} request - Reading free games from KV storage`);
 
 				try {
+					// NEW v5.2.0: GET request with ?topic_type=2 query parameter (we ignore it and return all)
+					if (request.method === 'GET') {
+						const topicTypeParam = url.searchParams.get('topic_type');
+						console.log(`[FREE_GAMES] GET request with topic_type=${topicTypeParam} (returning all topics)`);
+					}
+					// OLD v3: POST request (no topic_type filtering)
+					else if (request.method === 'POST') {
+						console.log('[FREE_GAMES] POST request (backward compatibility mode)');
+					}
+
 					// Read directly from KV (same storage as Free Games Worker)
 					const cachedData = await env.FREE_GAMES_KV.get('free_games_data');
 
@@ -343,14 +427,17 @@ export default {
 
 					console.log('[FREE_GAMES] Successfully read free games from KV');
 
-					// Parse the data and limit card_list to display_card_num
-					const freeGamesData = JSON.parse(cachedData);
+					// Parse the data
+					let freeGamesData = JSON.parse(cachedData);
 
+					// BOTH OLD & NEW: Return ALL topics with initial display_card_num items
 					// Slice each topic's card_list to display_card_num (initially show 6 items max)
 					freeGamesData.data = freeGamesData.data.map(topic => ({
 						...topic,
 						card_list: topic.card_list.slice(0, topic.display_card_num)
 					}));
+
+					console.log(`[FREE_GAMES] Returning ${freeGamesData.data.length} topics with initial items`);
 
 					return new Response(JSON.stringify(freeGamesData), {
 						headers: {
@@ -507,21 +594,28 @@ export default {
 				});
 			}
 
-			// Handle /cloud/game/check_user_timer endpoint (important for Steam cloud sync)
+			// Handle /cloud/game/check_user_timer endpoint (proxy to Chinese server)
 			if (url.pathname === '/cloud/game/check_user_timer' && request.method === 'POST') {
-				const timerUrl = `${GITHUB_BASE}/cloud/game/check_user_timer`;
-				const response = await fetch(timerUrl);
-
-				if (!response.ok) {
-					return new Response(JSON.stringify({ code: 500, msg: 'Failed to check timer' }), {
-						status: 500,
-						headers: { 'Content-Type': 'application/json', ...allHeaders },
-					});
+				// Reuse bodyText if we already read it during token replacement
+				if (!bodyText) {
+					bodyText = await request.text();
 				}
 
-				const data = await response.json();
-				return new Response(JSON.stringify(data), {
-					headers: { 'Content-Type': 'application/json', ...allHeaders },
+				// Forward request to Chinese server with all original headers
+				const chineseResponse = await fetch('https://landscape-api.vgabc.com/cloud/game/check_user_timer', {
+					method: 'POST',
+					headers: request.headers,
+					body: bodyText,
+				});
+
+				const responseData = await chineseResponse.json();
+
+				// Return the Chinese server response as-is
+				return new Response(JSON.stringify(responseData), {
+					headers: {
+						'Content-Type': 'application/json',
+						...allHeaders
+					},
 				});
 			}
 
